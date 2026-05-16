@@ -3,66 +3,90 @@ import mediapipe as mp
 import numpy as np
 from scipy.signal import butter, filtfilt
 
-# Store green signal values
+# Store signal values
 green_signal = []
+bpm_history = []
 
-# Open webcam
+# Webcam
 camera = cv2.VideoCapture(0)
 
 # MediaPipe face detector
 mp_face = mp.solutions.face_detection
 face_detector = mp_face.FaceDetection(
     model_selection=0,
-    min_detection_confidence=0.5
+    min_detection_confidence=0.6
 )
 
-# Signal filtering function
+FPS = 30
+WINDOW_SIZE = 450  # 15 seconds
+
+
+# -----------------------------
+# Signal Filtering
+# -----------------------------
 def filter_signal(signal):
 
     low = 0.7
     high = 4.0
-    fs = 30  # webcam FPS
 
-    nyquist = fs / 2
+    nyquist = FPS / 2
 
     low = low / nyquist
     high = high / nyquist
 
-    b, a = butter(3, [low, high], btype='band')
+    b, a = butter(
+        3,
+        [low, high],
+        btype='band'
+    )
 
-    filtered = filtfilt(b, a, signal)
+    filtered = filtfilt(
+        b,
+        a,
+        signal
+    )
 
     return filtered
 
 
-# BPM calculation
+# -----------------------------
+# BPM Calculation
+# -----------------------------
 def calculate_bpm(signal):
 
     fft = np.fft.rfft(signal)
 
-    frequencies = np.fft.rfftfreq(len(signal), d=1/30)
+    frequencies = np.fft.rfftfreq(
+        len(signal),
+        d=1/FPS
+    )
 
-    fft_magnitude = np.abs(fft)
+    magnitude = np.abs(fft)
 
-    # Ignore unrealistic frequencies
-    valid_idx = np.where((frequencies >= 0.7) &
-                         (frequencies <= 4.0))
+    # Valid heart-rate range
+    valid_idx = np.where(
+        (frequencies >= 0.7) &
+        (frequencies <= 4.0)
+    )
 
     valid_freqs = frequencies[valid_idx]
-    valid_fft = fft_magnitude[valid_idx]
+    valid_mag = magnitude[valid_idx]
 
-    if len(valid_fft) == 0:
+    if len(valid_mag) == 0:
         return 0
 
-    strongest_frequency = valid_freqs[
-        np.argmax(valid_fft)
+    dominant_frequency = valid_freqs[
+        np.argmax(valid_mag)
     ]
 
-    bpm = strongest_frequency * 60
+    bpm = dominant_frequency * 60
 
     return int(bpm)
 
 
+# -----------------------------
+# Main Loop
+# -----------------------------
 while True:
 
     success, frame = camera.read()
@@ -70,13 +94,16 @@ while True:
     if not success:
         break
 
-    # Flip camera (mirror effect)
+    # Mirror camera
     frame = cv2.flip(frame, 1)
 
-    # Convert to RGB
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    # RGB conversion
+    rgb = cv2.cvtColor(
+        frame,
+        cv2.COLOR_BGR2RGB
+    )
 
-    # Detect face
+    # Face detection
     result = face_detector.process(rgb)
 
     if result.detections:
@@ -105,47 +132,65 @@ while True:
                 2
             )
 
-            # Forehead ROI
+            # -----------------------------
+            # Better forehead ROI
+            # Use center forehead only
+            # -----------------------------
             forehead = frame[
                 y:y + 50,
-                x:x + width
+                x + width//4:
+                x + 3*width//4
             ]
 
-            # Draw forehead box
+            # Draw forehead rectangle
             cv2.rectangle(
                 frame,
-                (x, y),
-                (x + width, y + 50),
+                (x + width//4, y),
+                (x + 3*width//4, y + 50),
                 (255, 0, 0),
                 2
             )
 
-            # Avoid empty ROI
             if forehead.size > 0:
 
-                # Mean green intensity
+                # Green channel mean
                 green_value = np.mean(
                     forehead[:, :, 1]
                 )
 
-                green_signal.append(green_value)
+                green_signal.append(
+                    green_value
+                )
 
-                # Keep only latest 300 samples
-                if len(green_signal) > 300:
-                    green_signal = green_signal[-300:]
+                # Keep latest samples
+                if len(green_signal) > WINDOW_SIZE:
+                    green_signal = green_signal[-WINDOW_SIZE:]
 
                     try:
+                        # Filter signal
                         filtered_signal = filter_signal(
                             green_signal
                         )
 
+                        # Calculate BPM
                         bpm = calculate_bpm(
                             filtered_signal
                         )
 
+                        # Smooth BPM
+                        bpm_history.append(bpm)
+
+                        if len(bpm_history) > 10:
+                            bpm_history.pop(0)
+
+                        stable_bpm = int(
+                            np.mean(bpm_history)
+                        )
+
+                        # Display BPM
                         cv2.putText(
                             frame,
-                            f'Heart Rate: {bpm} BPM',
+                            f'Heart Rate: {stable_bpm} BPM',
                             (20, 50),
                             cv2.FONT_HERSHEY_SIMPLEX,
                             1,
@@ -153,7 +198,7 @@ while True:
                             2
                         )
 
-                    except:
+                    except Exception:
                         pass
 
     cv2.imshow(
