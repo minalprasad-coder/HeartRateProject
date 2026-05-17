@@ -3,26 +3,29 @@ import mediapipe as mp
 import numpy as np
 from scipy.signal import butter, filtfilt
 
-# Store signal values
-green_signal = []
-bpm_history = []
-
-# Webcam
+# Setup
 camera = cv2.VideoCapture(0)
 
-# MediaPipe face detector
-mp_face = mp.solutions.face_detection
-face_detector = mp_face.FaceDetection(
-    model_selection=0,
-    min_detection_confidence=0.6
-)
-
 FPS = 30
-WINDOW_SIZE = 450  # 15 seconds
+WINDOW_SIZE = 450  # 15 sec
+
+signal_values = []
+bpm_history = []
+
+# MediaPipe Face Mesh
+mp_face_mesh = mp.solutions.face_mesh
+
+face_mesh = mp_face_mesh.FaceMesh(
+    static_image_mode=False,
+    max_num_faces=1,
+    refine_landmarks=True,
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5
+)
 
 
 # -----------------------------
-# Signal Filtering
+# Filter signal
 # -----------------------------
 def filter_signal(signal):
 
@@ -50,33 +53,32 @@ def filter_signal(signal):
 
 
 # -----------------------------
-# BPM Calculation
+# Calculate BPM
 # -----------------------------
 def calculate_bpm(signal):
 
     fft = np.fft.rfft(signal)
 
-    frequencies = np.fft.rfftfreq(
+    freqs = np.fft.rfftfreq(
         len(signal),
         d=1/FPS
     )
 
     magnitude = np.abs(fft)
 
-    # Valid heart-rate range
     valid_idx = np.where(
-        (frequencies >= 0.7) &
-        (frequencies <= 4.0)
+        (freqs >= 0.7) &
+        (freqs <= 4.0)
     )
 
-    valid_freqs = frequencies[valid_idx]
-    valid_mag = magnitude[valid_idx]
+    valid_freqs = freqs[valid_idx]
+    valid_magnitude = magnitude[valid_idx]
 
-    if len(valid_mag) == 0:
+    if len(valid_magnitude) == 0:
         return 0
 
     dominant_frequency = valid_freqs[
-        np.argmax(valid_mag)
+        np.argmax(valid_magnitude)
     ]
 
     bpm = dominant_frequency * 60
@@ -85,7 +87,38 @@ def calculate_bpm(signal):
 
 
 # -----------------------------
-# Main Loop
+# Get ROI from landmarks
+# -----------------------------
+def get_roi(frame, landmarks, indices):
+
+    h, w, _ = frame.shape
+
+    points = []
+
+    for idx in indices:
+        x = int(
+            landmarks[idx].x * w
+        )
+        y = int(
+            landmarks[idx].y * h
+        )
+
+        points.append((x, y))
+
+    points = np.array(points)
+
+    x, y, width, height = cv2.boundingRect(points)
+
+    roi = frame[
+        y:y + height,
+        x:x + width
+    ]
+
+    return roi, (x, y, width, height)
+
+
+# -----------------------------
+# Main loop
 # -----------------------------
 while True:
 
@@ -94,120 +127,178 @@ while True:
     if not success:
         break
 
-    # Mirror camera
     frame = cv2.flip(frame, 1)
 
-    # RGB conversion
     rgb = cv2.cvtColor(
         frame,
         cv2.COLOR_BGR2RGB
     )
 
-    # Face detection
-    result = face_detector.process(rgb)
+    result = face_mesh.process(rgb)
 
-    if result.detections:
+    if result.multi_face_landmarks:
 
-        for detection in result.detections:
+        face_landmarks = (
+            result.multi_face_landmarks[0]
+            .landmark
+        )
 
-            bbox = detection.location_data.relative_bounding_box
+        # ROI landmark points
+        forehead_points = [
+            10, 67, 103, 109, 338,
+            297, 332, 284
+        ]
 
-            h, w, c = frame.shape
+        left_cheek_points = [
+            50, 101, 118, 119,
+            120, 121, 205
+        ]
 
-            x = int(bbox.xmin * w)
-            y = int(bbox.ymin * h)
-            width = int(bbox.width * w)
-            height = int(bbox.height * h)
+        right_cheek_points = [
+            280, 330, 347,
+            348, 349, 350,
+            425
+        ]
 
-            # Prevent negative coordinates
-            x = max(0, x)
-            y = max(0, y)
+        # Extract ROIs
+        forehead, f_box = get_roi(
+            frame,
+            face_landmarks,
+            forehead_points
+        )
 
-            # Draw face rectangle
+        left_cheek, lc_box = get_roi(
+            frame,
+            face_landmarks,
+            left_cheek_points
+        )
+
+        right_cheek, rc_box = get_roi(
+            frame,
+            face_landmarks,
+            right_cheek_points
+        )
+
+        # Draw ROI boxes
+        for box in [
+            f_box,
+            lc_box,
+            rc_box
+        ]:
+
+            x, y, w, h = box
+
             cv2.rectangle(
                 frame,
                 (x, y),
-                (x + width, y + height),
-                (0, 255, 0),
-                2
-            )
-
-            # -----------------------------
-            # Better forehead ROI
-            # Use center forehead only
-            # -----------------------------
-            forehead = frame[
-                y:y + 50,
-                x + width//4:
-                x + 3*width//4
-            ]
-
-            # Draw forehead rectangle
-            cv2.rectangle(
-                frame,
-                (x + width//4, y),
-                (x + 3*width//4, y + 50),
+                (x + w, y + h),
                 (255, 0, 0),
                 2
             )
 
-            if forehead.size > 0:
+        # Check ROIs exist
+        if (
+            forehead.size > 0
+            and left_cheek.size > 0
+            and right_cheek.size > 0
+        ):
 
-                # Green channel mean
-                green_value = np.mean(
-                    forehead[:, :, 1]
+            # Green signals
+            forehead_green = np.mean(
+                forehead[:, :, 1]
+            )
+
+            left_green = np.mean(
+                left_cheek[:, :, 1]
+            )
+
+            right_green = np.mean(
+                right_cheek[:, :, 1]
+            )
+
+            # Average signal
+            final_signal = (
+                forehead_green +
+                left_green +
+                right_green
+            ) / 3
+
+            signal_values.append(
+                final_signal
+            )
+
+            # Keep latest values
+            if len(signal_values) > WINDOW_SIZE:
+
+                signal_values = (
+                    signal_values[
+                        -WINDOW_SIZE:
+                    ]
                 )
 
-                green_signal.append(
-                    green_value
-                )
+                try:
 
-                # Keep latest samples
-                if len(green_signal) > WINDOW_SIZE:
-                    green_signal = green_signal[-WINDOW_SIZE:]
+                    filtered_signal = (
+                        filter_signal(
+                            signal_values
+                        )
+                    )
 
-                    try:
-                        # Filter signal
-                        filtered_signal = filter_signal(
-                            green_signal
+                    # Extra smoothing
+                    filtered_signal = (
+                        np.convolve(
+                            filtered_signal,
+                            np.ones(5)/5,
+                            mode='same'
+                        )
+                    )
+
+                    bpm = calculate_bpm(
+                        filtered_signal
+                    )
+
+                    # Ignore impossible BPM
+                    if 50 <= bpm <= 120:
+
+                        bpm_history.append(
+                            bpm
                         )
 
-                        # Calculate BPM
-                        bpm = calculate_bpm(
-                            filtered_signal
+                    if len(
+                        bpm_history
+                    ) > 10:
+
+                        bpm_history.pop(0)
+
+                    stable_bpm = int(
+                        np.mean(
+                            bpm_history
                         )
+                    )
 
-                        # Smooth BPM
-                        bpm_history.append(bpm)
+                    cv2.putText(
+                        frame,
+                        f'Heart Rate: '
+                        f'{stable_bpm} BPM',
+                        (20, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        1,
+                        (0, 255, 0),
+                        2
+                    )
 
-                        if len(bpm_history) > 10:
-                            bpm_history.pop(0)
-
-                        stable_bpm = int(
-                            np.mean(bpm_history)
-                        )
-
-                        # Display BPM
-                        cv2.putText(
-                            frame,
-                            f'Heart Rate: {stable_bpm} BPM',
-                            (20, 50),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            1,
-                            (0, 255, 0),
-                            2
-                        )
-
-                    except Exception:
-                        pass
+                except Exception:
+                    pass
 
     cv2.imshow(
-        "Heart Rate Detection using rPPG",
+        "Advanced rPPG Heart Rate",
         frame
     )
 
-    # Press Q to quit
-    if cv2.waitKey(1) & 0xFF == ord('q'):
+    if (
+        cv2.waitKey(1)
+        & 0xFF == ord('q')
+    ):
         break
 
 camera.release()
